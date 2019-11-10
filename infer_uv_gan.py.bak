@@ -1,0 +1,175 @@
+from __future__ import absolute_import, division, print_function, unicode_literals
+import os
+os.environ["CUDA_VISIBLE_DEVICES"]=""
+
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import os
+import time
+import cv2
+import numpy as np
+
+BATCH_SIZE = 1
+IMG_WIDTH = 256
+IMG_HEIGHT = 256
+
+def load(input_path):
+  
+  # image_name = tf.strings.as_string(input_path)
+  
+  input_image = tf.io.read_file(input_path)
+  input_image = tf.image.decode_jpeg(input_image)
+  return input_image
+
+def resize(input_image, height, width):
+  input_image = tf.image.resize(input_image, [height, width],
+                                method=tf.image.ResizeMethod.NEAREST_NEIGHBOR)
+  return input_image
+
+# normalizing the images to [-1, 1]
+
+def normalize(input_image):
+  input_image = (tf.cast(input_image, tf.float32) / 127.5) - 1
+  return input_image 
+
+@tf.function()
+def random_jitter(input_image):
+  # resizing to 286 x 286 x 3
+  input_image = resize(input_image, 256, 256)
+  flip_image = tf.image.flip_left_right(input_image)
+  input_image = tf.concat([input_image, flip_image], axis=2)
+  return input_image
+
+def load_image_test(image_file):
+  input_image = load(image_file)
+  input_image = random_jitter(input_image)
+  input_image = normalize(input_image)
+
+  return input_image
+
+
+test_dataset = tf.data.Dataset.list_files('~/Code/3DDFA/samples/*.[pj]*')
+test_dataset = test_dataset.map(load_image_test)
+test_dataset = test_dataset.batch(BATCH_SIZE)
+
+OUTPUT_CHANNELS = 3
+def downsample(filters, size, apply_batchnorm=True):
+  initializer = tf.random_normal_initializer(0., 0.02)
+
+  result = tf.keras.Sequential()
+  result.add(
+      tf.keras.layers.Conv2D(filters, size, strides=2, padding='same',
+                             kernel_initializer=initializer, use_bias=False))
+
+  if apply_batchnorm:
+    result.add(tf.keras.layers.BatchNormalization())
+
+  result.add(tf.keras.layers.LeakyReLU())
+
+  return result
+
+def upsample(filters, size, apply_dropout=False):
+  initializer = tf.random_normal_initializer(0., 0.02)
+
+  result = tf.keras.Sequential()
+  result.add(
+    tf.keras.layers.Conv2DTranspose(filters, size, strides=2,
+                                    padding='same',
+                                    kernel_initializer=initializer,
+                                    use_bias=False))
+
+  result.add(tf.keras.layers.BatchNormalization())
+
+  if apply_dropout:
+      result.add(tf.keras.layers.Dropout(0.5))
+
+  result.add(tf.keras.layers.ReLU())
+
+  return result
+
+def Generator():
+  down_stack = [
+    downsample(64, 4, apply_batchnorm=False), # (bs, 128, 128, 64)
+    downsample(128, 4), # (bs, 64, 64, 128)
+    downsample(256, 4), # (bs, 32, 32, 256)
+    downsample(512, 4), # (bs, 16, 16, 512)
+    downsample(512, 4), # (bs, 8, 8, 512)
+    downsample(512, 4), # (bs, 4, 4, 512)
+    downsample(512, 4), # (bs, 2, 2, 512)
+    downsample(512, 4), # (bs, 1, 1, 512)
+  ]
+
+  up_stack = [
+    upsample(512, 4, apply_dropout=True), # (bs, 2, 2, 1024)
+    upsample(512, 4, apply_dropout=True), # (bs, 4, 4, 1024)
+    upsample(512, 4, apply_dropout=True), # (bs, 8, 8, 1024)
+    upsample(512, 4), # (bs, 16, 16, 1024)
+    upsample(256, 4), # (bs, 32, 32, 512)
+    upsample(128, 4), # (bs, 64, 64, 256)
+    upsample(64, 4), # (bs, 128, 128, 128)
+  ]
+
+  initializer = tf.random_normal_initializer(0., 0.02)
+  last = tf.keras.layers.Conv2DTranspose(OUTPUT_CHANNELS, 4,
+                                         strides=2,
+                                         padding='same',
+                                         kernel_initializer=initializer,
+                                         activation='tanh') # (bs, 256, 256, 3)
+
+  concat = tf.keras.layers.Concatenate()
+
+  inputs = tf.keras.layers.Input(shape=[None,None,6])
+  x = inputs
+
+  # Downsampling through the model
+  skips = []
+  for down in down_stack:
+    x = down(x)
+    skips.append(x)
+
+  skips = reversed(skips[:-1])
+
+  # Upsampling and establishing the skip connections
+  for up, skip in zip(up_stack, skips):
+    x = up(x)
+    x = concat([x, skip])
+
+  x = last(x)
+
+  return tf.keras.Model(inputs=inputs, outputs=x)
+
+generator = Generator()
+
+checkpoint_dir = './training_checkpoints_1'
+checkpoint = tf.train.Checkpoint(generator=generator)
+
+def generate_images(model, test_input, epoch):
+  prediction = model(test_input, training=True)
+  path_to_save = './test_image_try_2_checkpoint100/'
+  if not os.path.exists(path_to_save):
+    os.makedirs(path_to_save)
+
+  n_images = test_input.shape[0]
+  for n_image in range(n_images):
+      name_save = path_to_save + str(epoch) + "_"  + str(n_image) + '.jpg'
+      tmp = ((np.array(prediction[n_image])+1)*127.5).astype('uint8')
+      tmp = cv2.cvtColor(tmp, cv2.COLOR_BGR2RGB)
+      tmp = cv2.resize(tmp, (595,377))
+      cv2.imwrite(name_save, tmp)
+
+def uv_gan_infer():
+    pass
+
+
+checkpoint.restore(tf.train.latest_checkpoint(checkpoint_dir))
+# Run the trained model on the entire test dataset
+for inp in test_dataset.take(1):
+  #print(inp.shape)
+  generate_images(generator, inp, 'test__100')
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='uv_gan infer in the wild')
+    parser.add_argument('-c', '--checkpoint_path', default=[''], nargs='+', help='checkpoint path of uv-gan')
+    parser.add_argument('-m', '--mode', default='cpu', type=str, help='gpu or cpu mode')
+    args = parser.parse_args()
+    main(args)
