@@ -1,1 +1,0 @@
-# 3ddfa-uv-gan
